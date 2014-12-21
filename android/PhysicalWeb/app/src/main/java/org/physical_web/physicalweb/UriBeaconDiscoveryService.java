@@ -25,8 +25,12 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.res.Resources;
 import android.graphics.Bitmap;
+import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.support.v4.app.NotificationCompat;
 import android.support.v4.app.NotificationManagerCompat;
 import android.util.Log;
@@ -48,6 +52,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * This is a service that scans for nearby uriBeacons.
@@ -86,10 +91,24 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
       Log.d(TAG, "onScanFailed  " + "errorCode: " + errorCode);
     }
   };
+  private Runnable mFirstUriBeaconScanTimeout = new Runnable() {
+    @Override
+    public void run() {
+      // Stop low latency scanning
+      getLeScanner().stopScan(mScanCallback);
+      // Start low power scanning
+      startUriBeaconScan(ScanSettings.SCAN_MODE_LOW_POWER);
+    }
+  };
   private static final String NOTIFICATION_GROUP_KEY = "URI_BEACON_NOTIFICATIONS";
   private static final int NEAREST_BEACON_NOTIFICATION_ID = 23;
   private static final int SECOND_NEAREST_BEACON_NOTIFICATION_ID = 24;
   private static final int SUMMARY_NOTIFICATION_ID = 25;
+  private static final int TIMEOUT_FOR_OLD_BEACONS = 2;
+  private static final int NON_LOLLIPOP_NOTIFICATION_TITLE_COLOR = Color.parseColor("#ffffff");
+  private static final int NON_LOLLIPOP_NOTIFICATION_URL_COLOR = Color.parseColor("#999999");
+  private static final int NON_LOLLIPOP_NOTIFICATION_SNIPPET_COLOR = Color.parseColor("#999999");
+  private static final long DURATION_FIRST_URI_BEACON_SCAN = TimeUnit.SECONDS.toMillis(2);
   private ScreenBroadcastReceiver mScreenStateBroadcastReceiver;
   private RegionResolver mRegionResolver;
   private NotificationManagerCompat mNotificationManager;
@@ -97,6 +116,7 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
   private List<String> mSortedDevices;
   private HashMap<String, String> mDeviceAddressToUrl;
   private MdnsUrlDiscoverer mMdnsUrlDiscoverer;
+  private Handler mHandler;
   private Comparator<String> mComparator = new Comparator<String>() {
     @Override
     public int compare(String address, String otherAddress) {
@@ -132,15 +152,17 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
   }
 
   private void initialize() {
-    mRegionResolver = new RegionResolver();
+    mHandler = new Handler();
     mNotificationManager = NotificationManagerCompat.from(this);
+    mMdnsUrlDiscoverer = new MdnsUrlDiscoverer(this, UriBeaconDiscoveryService.this);
+    initializeScreenStateBroadcastReceiver();
+  }
+
+  private void initializeLists() {
+    mRegionResolver = new RegionResolver();
     mUrlToUrlMetadata = new HashMap<>();
     mSortedDevices = null;
     mDeviceAddressToUrl = new HashMap<>();
-    mMdnsUrlDiscoverer = new MdnsUrlDiscoverer(this, UriBeaconDiscoveryService.this);
-    initializeScreenStateBroadcastReceiver();
-    startSearchingForUriBeacons();
-    mMdnsUrlDiscoverer.startScanning();
   }
 
   /**
@@ -167,6 +189,18 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
 
   @Override
   public int onStartCommand(Intent intent, int flags, int startId) {
+    // Since sometimes the lists have values when onStartCommand gets called
+    initializeLists();
+    // Start scanning only if the screen is on
+    PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+    if (powerManager.isScreenOn()) {
+      // Start a brief low latency scan
+      startUriBeaconScan(ScanSettings.SCAN_MODE_LOW_LATENCY);
+      mHandler.postDelayed(mFirstUriBeaconScanTimeout, DURATION_FIRST_URI_BEACON_SCAN);
+      // Start mdns discovery
+      mMdnsUrlDiscoverer.startScanning();
+    }
+
     //make sure the service keeps running
     return START_STICKY;
   }
@@ -180,11 +214,11 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
   @Override
   public void onDestroy() {
     Log.d(TAG, "onDestroy:  service exiting");
-    stopSearchingForUriBeacons();
+    getLeScanner().stopScan(mScanCallback);
+    mHandler.removeCallbacks(mFirstUriBeaconScanTimeout);
     mMdnsUrlDiscoverer.stopScanning();
     unregisterReceiver(mScreenStateBroadcastReceiver);
-    mUrlToUrlMetadata = new HashMap<>();
-    cancelNotifications();
+    mNotificationManager.cancelAll();
   }
 
   @Override
@@ -217,10 +251,10 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
     }
   }
 
-  private void startSearchingForUriBeacons() {
+  private void startUriBeaconScan(int scanMode) {
     ScanSettings settings = new ScanSettings.Builder()
         .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-        .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
+        .setScanMode(scanMode)
         .build();
 
     List<ScanFilter> filters = new ArrayList<>();
@@ -233,30 +267,29 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
 
     filters.add(filter);
 
-    boolean started = getLeScanner().startScan(filters, settings, mScanCallback);
-    Log.v(TAG, started ? "... scan started" : "... scan NOT started");
-  }
-
-  private void stopSearchingForUriBeacons() {
-    getLeScanner().stopScan(mScanCallback);
+    getLeScanner().startScan(filters, settings, mScanCallback);
   }
 
   private void handleFoundDevice(ScanResult scanResult) {
-    UriBeacon uriBeacon = UriBeacon.parseFromBytes(scanResult.getScanRecord().getBytes());
-    if (uriBeacon != null) {
-      String address = scanResult.getDevice().getAddress();
-      int rssi = scanResult.getRssi();
-      int txPowerLevel = uriBeacon.getTxPowerLevel();
-      String url = uriBeacon.getUriString();
-      // If we haven't yet seen this url
-      if (!mUrlToUrlMetadata.containsKey(url)) {
-        mUrlToUrlMetadata.put(url, null);
-        mDeviceAddressToUrl.put(address, url);
-        // Fetch the metadata for this url
-        MetadataResolver.findUrlMetadata(this, UriBeaconDiscoveryService.this, url);
+    long timeStamp = scanResult.getTimestampNanos();
+    long now = TimeUnit.MILLISECONDS.toNanos(System.currentTimeMillis());
+    if (now - timeStamp < TimeUnit.SECONDS.toNanos(TIMEOUT_FOR_OLD_BEACONS)) {
+      UriBeacon uriBeacon = UriBeacon.parseFromBytes(scanResult.getScanRecord().getBytes());
+      if (uriBeacon != null) {
+        String address = scanResult.getDevice().getAddress();
+        int rssi = scanResult.getRssi();
+        int txPowerLevel = uriBeacon.getTxPowerLevel();
+        String url = uriBeacon.getUriString();
+        // If we haven't yet seen this url
+        if (!mUrlToUrlMetadata.containsKey(url)) {
+          mUrlToUrlMetadata.put(url, null);
+          mDeviceAddressToUrl.put(address, url);
+          // Fetch the metadata for this url
+          MetadataResolver.findUrlMetadata(this, UriBeaconDiscoveryService.this, url);
+        }
+        // Update the ranging data
+        mRegionResolver.onUpdate(address, rssi, txPowerLevel);
       }
-      // Update the ranging data
-      mRegionResolver.onUpdate(address, rssi, txPowerLevel);
     }
   }
 
@@ -264,13 +297,12 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
    * Create a new set of notifications or update those existing
    */
   private void updateNotifications() {
-    mSortedDevices = new ArrayList<>(mDeviceAddressToUrl.keySet());
-    Collections.sort(mSortedDevices, mComparator);
+    mSortedDevices = getSortedBeaconsWithMetadata();
 
     // If no beacons have been found
     if (mSortedDevices.size() == 0) {
       // Remove all existing notifications
-      cancelNotifications();
+      mNotificationManager.cancelAll();
       return;
     }
     // If at least one beacon has been found
@@ -287,6 +319,17 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
       // Create a summary notification for both beacon notifications
       updateSummaryNotification();
     }
+  }
+
+  private ArrayList<String> getSortedBeaconsWithMetadata() {
+    ArrayList<String> unSorted = new ArrayList<>(mDeviceAddressToUrl.size());
+    for (String key : mDeviceAddressToUrl.keySet()) {
+      if (mUrlToUrlMetadata.get(mDeviceAddressToUrl.get(key)) != null) {
+        unSorted.add(key);
+      }
+    }
+    Collections.sort(unSorted, mComparator);
+    return unSorted;
   }
 
   /**
@@ -307,7 +350,8 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
     }
     navigateToBeaconUrlIntent.setData(Uri.parse(url));
     int requestID = (int) System.currentTimeMillis();
-    PendingIntent pendingIntent = PendingIntent.getActivity(this, requestID, navigateToBeaconUrlIntent, 0);
+    PendingIntent pendingIntent = PendingIntent.getActivity(this, requestID,
+        navigateToBeaconUrlIntent, 0);
 
     String title = urlMetadata.title;
     String description = urlMetadata.description;
@@ -366,7 +410,6 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
     // if the user taps the notification
     // TODO: Use a clickListener on the VIEW MORE button to do this
     Intent intent_returnToApp = new Intent(this, MainActivity.class);
-    intent_returnToApp.putExtra("isFromUriBeaconDiscoveryService", true);
     int requestID = (int) System.currentTimeMillis();
     PendingIntent pendingIntent = PendingIntent.getActivity(this, requestID, intent_returnToApp, 0);
     remoteViews.setOnClickPendingIntent(R.id.otherBeaconsLayout, pendingIntent);
@@ -384,6 +427,12 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
       remoteViews.setTextViewText(R.id.title_firstBeacon, title);
       remoteViews.setTextViewText(R.id.url_firstBeacon, url);
       remoteViews.setTextViewText(R.id.description_firstBeacon, description);
+      // Recolor notifications to have light text for non-Lollipop devices
+      if (!(android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP)) {
+        remoteViews.setTextColor(R.id.title_firstBeacon, NON_LOLLIPOP_NOTIFICATION_TITLE_COLOR);
+        remoteViews.setTextColor(R.id.url_firstBeacon, NON_LOLLIPOP_NOTIFICATION_URL_COLOR);
+        remoteViews.setTextColor(R.id.description_firstBeacon, NON_LOLLIPOP_NOTIFICATION_SNIPPET_COLOR);
+      }
 
       // Create an intent that will open the browser to the beacon's url
       // if the user taps the notification
@@ -395,7 +444,6 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
       int requestID = (int) System.currentTimeMillis();
       PendingIntent pendingIntent = PendingIntent.getActivity(this, requestID, intent_firstBeacon, 0);
       remoteViews.setOnClickPendingIntent(R.id.first_beacon_main_layout, pendingIntent);
-
       remoteViews.setViewVisibility(R.id.firstBeaconLayout, View.VISIBLE);
     } else {
       remoteViews.setViewVisibility(R.id.firstBeaconLayout, View.GONE);
@@ -412,6 +460,12 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
       remoteViews.setTextViewText(R.id.title_secondBeacon, title);
       remoteViews.setTextViewText(R.id.url_secondBeacon, url);
       remoteViews.setTextViewText(R.id.description_secondBeacon, description);
+      // Recolor notifications to have light text for non-Lollipop devices
+      if (!(android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP)) {
+        remoteViews.setTextColor(R.id.title_secondBeacon, NON_LOLLIPOP_NOTIFICATION_TITLE_COLOR);
+        remoteViews.setTextColor(R.id.url_secondBeacon, NON_LOLLIPOP_NOTIFICATION_URL_COLOR);
+        remoteViews.setTextColor(R.id.description_secondBeacon, NON_LOLLIPOP_NOTIFICATION_SNIPPET_COLOR);
+      }
 
       // Create an intent that will open the browser to the beacon's url
       // if the user taps the notification
@@ -423,17 +477,10 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
       int requestID = (int) System.currentTimeMillis();
       PendingIntent pendingIntent = PendingIntent.getActivity(this, requestID, intent_secondBeacon, 0);
       remoteViews.setOnClickPendingIntent(R.id.second_beacon_main_layout, pendingIntent);
-
       remoteViews.setViewVisibility(R.id.secondBeaconLayout, View.VISIBLE);
     } else {
       remoteViews.setViewVisibility(R.id.secondBeaconLayout, View.GONE);
     }
-  }
-
-  private void cancelNotifications() {
-    mNotificationManager.cancel(SUMMARY_NOTIFICATION_ID);
-    mNotificationManager.cancel(SECOND_NEAREST_BEACON_NOTIFICATION_ID);
-    mNotificationManager.cancel(NEAREST_BEACON_NOTIFICATION_ID);
   }
 
   /**
@@ -443,11 +490,18 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
     @Override
     public void onReceive(Context context, Intent intent) {
       boolean isScreenOn = Intent.ACTION_SCREEN_ON.equals(intent.getAction());
+      initializeLists();
+      mNotificationManager.cancelAll();
       if (isScreenOn) {
-        startSearchingForUriBeacons();
+        // Start a brief low latency scan
+        startUriBeaconScan(ScanSettings.SCAN_MODE_LOW_LATENCY);
+        mHandler.postDelayed(mFirstUriBeaconScanTimeout, DURATION_FIRST_URI_BEACON_SCAN);
+        // Start mdns discovery
         mMdnsUrlDiscoverer.startScanning();
       } else {
-        stopSearchingForUriBeacons();
+        // Stop all scanning and service discovery
+        getLeScanner().stopScan(mScanCallback);
+        mHandler.removeCallbacks(mFirstUriBeaconScanTimeout);
         mMdnsUrlDiscoverer.stopScanning();
       }
     }
