@@ -2,14 +2,14 @@ apply plugin: 'com.android.application'
 
 android {
     compileSdkVersion 21
-    buildToolsVersion "21.0.2"
+    buildToolsVersion "21.1.2"
 
     defaultConfig {
         applicationId "physical_web.org.physicalweb"
         minSdkVersion 18
         targetSdkVersion 21
-        versionCode 4
-        versionName "0.1.737"
+        versionCode 7
+        versionName "0.1.801"
     }
 
     buildTypes {
@@ -33,7 +33,7 @@ repositories{
 dependencies {
     compile 'com.android.volley:volley@aar'
     compile 'org.uribeacon:uribeacon-library-release@aar'
-    compile 'com.android.support:appcompat-v7:21.0.0'
+    compile 'com.android.support:appcompat-v7:21.0.3'
     compile files('libs/google-api-client-1.19.0.jar')
     compile files('libs/google-http-client-1.19.0.jar')
     compile files('libs/google-api-services-urlshortener-v1-rev33-1.19.0.jar')
