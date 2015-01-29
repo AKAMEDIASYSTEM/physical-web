@@ -28,6 +28,7 @@ import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
 import android.os.PowerManager;
 import android.support.v4.app.NotificationCompat;
@@ -99,6 +100,9 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
   private static final int NON_LOLLIPOP_NOTIFICATION_URL_COLOR = Color.parseColor("#999999");
   private static final int NON_LOLLIPOP_NOTIFICATION_SNIPPET_COLOR = Color.parseColor("#999999");
   private static final int NOTIFICATION_PRIORITY = NotificationCompat.PRIORITY_LOW;
+  private static final long NOTIFICATION_UPDATE_GATE_DURATION = 1000;
+  private boolean mCanUpdateNotifications = false;
+  private Handler mHandler;
   private ScreenBroadcastReceiver mScreenStateBroadcastReceiver;
   private RegionResolver mRegionResolver;
   private NotificationManagerCompat mNotificationManager;
@@ -106,11 +110,11 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
   private List<String> mSortedDevices;
   private HashMap<String, String> mDeviceAddressToUrl;
   private MdnsUrlDiscoverer mMdnsUrlDiscoverer;
-  private Comparator<String> mComparator = new Comparator<String>() {
+  // Sort using local region-resolver regions
+  private Comparator<String> mSortByRegionResolverRegionComparator = new Comparator<String>() {
     @Override
     public int compare(String address, String otherAddress) {
-      // Sort by the stabilized region of the device, unless
-      // they are the same, in which case sort by distance.
+      // Check if one of the addresses is the nearest
       final String nearest = mRegionResolver.getNearestAddress();
       if (address.equals(nearest)) {
         return -1;
@@ -118,6 +122,7 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
       if (otherAddress.equals(nearest)) {
         return 1;
       }
+      // Otherwise sort by region
       int r1 = mRegionResolver.getRegion(address);
       int r2 = mRegionResolver.getRegion(otherAddress);
       if (r1 != r2) {
@@ -125,6 +130,44 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
       }
       // The two devices are in the same region, sort by device address.
       return address.compareTo(otherAddress);
+    }
+  };
+  // Sort using local proxy server scores
+  private Comparator<String> mSortByProxyServerScoreComparator = new Comparator<String>() {
+    @Override
+    public int compare(String addressA, String addressB) {
+      String urlA = mDeviceAddressToUrl.get(addressA);
+      String urlB = mDeviceAddressToUrl.get(addressB);
+      MetadataResolver.UrlMetadata urlMetadataA = mUrlToUrlMetadata.get(urlA);
+      MetadataResolver.UrlMetadata urlMetadataB = mUrlToUrlMetadata.get(urlB);
+      // If metadata exists for both urls
+      if ((urlMetadataA != null) && (urlMetadataB != null)) {
+        float scoreA = urlMetadataA.score;
+        float scoreB = urlMetadataB.score;
+        // If the scores are not equal
+        if (scoreA != scoreB) {
+          // Sort so that higher scores show up higher in the list
+          return ((Float) scoreB).compareTo(scoreA);
+        }
+        // The scores are equal so sort by metadata title
+        String titleA = urlMetadataA.title;
+        String titleB = urlMetadataB.title;
+        return titleA.compareTo(titleB);
+      }
+      // Sort the url with metadata to be first
+      if (urlMetadataA == null) {
+        return 1;
+      }
+      return -1;
+    }
+  };
+
+  // TODO: consider a more elegant solution for preventing notification conflicts
+  private Runnable mNotificationUpdateGateTimeout = new Runnable() {
+    @Override
+    public void run() {
+      mCanUpdateNotifications = true;
+      updateNotifications();
     }
   };
 
@@ -143,6 +186,7 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
   private void initialize() {
     mNotificationManager = NotificationManagerCompat.from(this);
     mMdnsUrlDiscoverer = new MdnsUrlDiscoverer(this, UriBeaconDiscoveryService.this);
+    mHandler = new Handler();
     initializeScreenStateBroadcastReceiver();
   }
 
@@ -182,6 +226,8 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
     // Start scanning only if the screen is on
     PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
     if (powerManager.isScreenOn()) {
+      mCanUpdateNotifications = false;
+      mHandler.postDelayed(mNotificationUpdateGateTimeout, NOTIFICATION_UPDATE_GATE_DURATION);
       startSearchingForUriBeacons();
       mMdnsUrlDiscoverer.startScanning();
     }
@@ -199,6 +245,7 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
   @Override
   public void onDestroy() {
     Log.d(TAG, "onDestroy:  service exiting");
+    mHandler.removeCallbacks(mNotificationUpdateGateTimeout);
     stopSearchingForUriBeacons();
     mMdnsUrlDiscoverer.stopScanning();
     unregisterReceiver(mScreenStateBroadcastReceiver);
@@ -231,7 +278,7 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
       mUrlToUrlMetadata.put(url, null);
       mDeviceAddressToUrl.put(mockAddress, url);
       mRegionResolver.onUpdate(mockAddress, mockRssi, mockTxPower);
-      MetadataResolver.findUrlMetadata(this, UriBeaconDiscoveryService.this, url);
+      MetadataResolver.findUrlMetadata(this, UriBeaconDiscoveryService.this, url, mockTxPower, mockRssi);
     }
   }
 
@@ -267,17 +314,17 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
       if (uriBeacon != null) {
         String address = scanResult.getDevice().getAddress();
         int rssi = scanResult.getRssi();
-        int txPowerLevel = uriBeacon.getTxPowerLevel();
+        int txPower = uriBeacon.getTxPowerLevel();
         String url = uriBeacon.getUriString();
         // If we haven't yet seen this url
         if (!mUrlToUrlMetadata.containsKey(url)) {
           mUrlToUrlMetadata.put(url, null);
           mDeviceAddressToUrl.put(address, url);
           // Fetch the metadata for this url
-          MetadataResolver.findUrlMetadata(this, UriBeaconDiscoveryService.this, url);
+          MetadataResolver.findUrlMetadata(this, UriBeaconDiscoveryService.this, url, txPower, rssi);
         }
         // Update the ranging data
-        mRegionResolver.onUpdate(address, rssi, txPowerLevel);
+        mRegionResolver.onUpdate(address, rssi, txPower);
       }
     }
   }
@@ -286,30 +333,30 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
    * Create a new set of notifications or update those existing
    */
   private void updateNotifications() {
+    if (!mCanUpdateNotifications) {
+      return;
+    }
+
     mSortedDevices = getSortedBeaconsWithMetadata();
 
     // If no beacons have been found
     if (mSortedDevices.size() == 0) {
       // Remove all existing notifications
       mNotificationManager.cancelAll();
-      return;
-    }
-
-    // If at least two beacons have been found
-    if (mSortedDevices.size() > 1) {
+    } else if (mSortedDevices.size() == 1) {
+      updateNearbyBeaconNotification(true, mDeviceAddressToUrl.get(mSortedDevices.get(0)),
+          NEAREST_BEACON_NOTIFICATION_ID);
+    } else {
       // Create a summary notification for both beacon notifications.
       // Do this first so that we don't first show the individual notifications
       updateSummaryNotification();
-      // Create or update a notification for this beacon
-      updateNearbyBeaconNotification(mDeviceAddressToUrl.get(mSortedDevices.get(1)),
+      // Create or update a notification for second beacon
+      updateNearbyBeaconNotification(false, mDeviceAddressToUrl.get(mSortedDevices.get(1)),
           SECOND_NEAREST_BEACON_NOTIFICATION_ID);
-    }
-
-    // If at least one beacon has been found
-    if (mSortedDevices.size() > 0) {
-      // Create or update a notification for this beacon
-      updateNearbyBeaconNotification(mDeviceAddressToUrl.get(mSortedDevices.get(0)),
+      // Create or update a notification for first beacon. Needs to be added last to show up top
+      updateNearbyBeaconNotification(false, mDeviceAddressToUrl.get(mSortedDevices.get(0)),
           NEAREST_BEACON_NOTIFICATION_ID);
+
     }
   }
 
@@ -320,7 +367,16 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
         unSorted.add(key);
       }
     }
-    Collections.sort(unSorted, mComparator);
+    // If there are scores in the metadata
+    if (MetadataResolver.checkIfMetadataContainsSortingScores(mUrlToUrlMetadata.values())) {
+      // Sort using those scores
+      Collections.sort(unSorted, mSortByProxyServerScoreComparator);
+    }
+    // If there are not scores in the metadata
+    else {
+      // Sort using the region resolver regions
+      Collections.sort(unSorted, mSortByRegionResolverRegionComparator);
+    }
     return unSorted;
   }
 
@@ -328,7 +384,7 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
    * Create or update a notification with the given id
    * for the beacon with the given address
    */
-  private void updateNearbyBeaconNotification(String url, int notificationId) {
+  private void updateNearbyBeaconNotification(boolean single, String url, int notificationId) {
     MetadataResolver.UrlMetadata urlMetadata = mUrlToUrlMetadata.get(url);
     if (urlMetadata == null) {
       return;
@@ -336,16 +392,7 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
 
     // Create an intent that will open the browser to the beacon's url
     // if the user taps on the notification
-    Intent navigateToBeaconUrlIntent = new Intent(Intent.ACTION_VIEW);
-    if (!URLUtil.isNetworkUrl(url)) {
-      url = "http://" + url;
-    }
-    // Route through the proxy server go link
-    url = MetadataResolver.createUrlProxyGoLink(url);
-    navigateToBeaconUrlIntent.setData(Uri.parse(url));
-    int requestID = (int) System.currentTimeMillis();
-    PendingIntent pendingIntent = PendingIntent.getActivity(this, requestID,
-        navigateToBeaconUrlIntent, 0);
+    PendingIntent pendingIntent = createNavigateToUrlPendingIntent(url);
 
     String title = urlMetadata.title;
     String description = urlMetadata.description;
@@ -356,8 +403,12 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
         .setContentTitle(title)
         .setContentText(description)
         .setPriority(NOTIFICATION_PRIORITY)
-        .setGroup(NOTIFICATION_GROUP_KEY)
         .setContentIntent(pendingIntent);
+    // For some reason if there is only one notification and you call setGroup
+    // the notification doesn't show up on the N7 running kit kat
+    if (!single) {
+      builder = builder.setGroup(NOTIFICATION_GROUP_KEY);
+    }
     Notification notification = builder.build();
 
     mNotificationManager.notify(notificationId, notification);
@@ -372,7 +423,8 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
     String contentTitle = String.valueOf(numNearbyBeacons) + " ";
     Resources resources = getResources();
     contentTitle += " " + resources.getQuantityString(R.plurals.numFoundBeacons, numNearbyBeacons, numNearbyBeacons);
-    String contentText = "Pull down to see them.";
+    String contentText = getString(R.string.summary_notification_pull_down);
+    PendingIntent pendingIntent = createReturnToAppPendingIntent();
     NotificationCompat.Builder builder = new NotificationCompat.Builder(this);
     Notification notification = builder.setSmallIcon(R.drawable.ic_notification)
         .setContentTitle(contentTitle)
@@ -381,6 +433,7 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
         .setGroup(NOTIFICATION_GROUP_KEY)
         .setGroupSummary(true)
         .setPriority(NOTIFICATION_PRIORITY)
+        .setContentIntent(pendingIntent)
         .build();
 
     // Create the big view for the notification (viewed by pulling down)
@@ -400,12 +453,9 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
     updateSummaryNotificationRemoteViewsFirstBeacon(mDeviceAddressToUrl.get(mSortedDevices.get(0)), remoteViews);
     updateSummaryNotificationRemoteViewsSecondBeacon(mDeviceAddressToUrl.get(mSortedDevices.get(1)), remoteViews);
 
-    // Create an intent that will open the browser to the beacon's url
-    // if the user taps the notification
+    // Create a pending intent that will open the physical web app
     // TODO: Use a clickListener on the VIEW MORE button to do this
-    Intent intent_returnToApp = new Intent(this, MainActivity.class);
-    int requestID = (int) System.currentTimeMillis();
-    PendingIntent pendingIntent = PendingIntent.getActivity(this, requestID, intent_returnToApp, 0);
+    PendingIntent pendingIntent = createReturnToAppPendingIntent();
     remoteViews.setOnClickPendingIntent(R.id.otherBeaconsLayout, pendingIntent);
 
     return remoteViews;
@@ -430,16 +480,7 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
 
       // Create an intent that will open the browser to the beacon's url
       // if the user taps the notification
-      if (!URLUtil.isNetworkUrl(url)) {
-        url = "http://" + url;
-      }
-      // Route through the proxy server go link
-      url = MetadataResolver.createUrlProxyGoLink(url);
-
-      Intent intent_firstBeacon = new Intent(Intent.ACTION_VIEW);
-      intent_firstBeacon.setData(Uri.parse(url));
-      int requestID = (int) System.currentTimeMillis();
-      PendingIntent pendingIntent = PendingIntent.getActivity(this, requestID, intent_firstBeacon, 0);
+      PendingIntent pendingIntent = createNavigateToUrlPendingIntent(url);
       remoteViews.setOnClickPendingIntent(R.id.first_beacon_main_layout, pendingIntent);
       remoteViews.setViewVisibility(R.id.firstBeaconLayout, View.VISIBLE);
     } else {
@@ -466,21 +507,40 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
 
       // Create an intent that will open the browser to the beacon's url
       // if the user taps the notification
-      if (!URLUtil.isNetworkUrl(url)) {
-        url = "http://" + url;
-      }
-      // Route through the proxy server go link
-      url = MetadataResolver.createUrlProxyGoLink(url);
-
-      Intent intent_secondBeacon = new Intent(Intent.ACTION_VIEW);
-      intent_secondBeacon.setData(Uri.parse(url));
-      int requestID = (int) System.currentTimeMillis();
-      PendingIntent pendingIntent = PendingIntent.getActivity(this, requestID, intent_secondBeacon, 0);
+      PendingIntent pendingIntent = createNavigateToUrlPendingIntent(url);
       remoteViews.setOnClickPendingIntent(R.id.second_beacon_main_layout, pendingIntent);
       remoteViews.setViewVisibility(R.id.secondBeaconLayout, View.VISIBLE);
     } else {
       remoteViews.setViewVisibility(R.id.secondBeaconLayout, View.GONE);
     }
+  }
+
+  private PendingIntent createReturnToAppPendingIntent() {
+    Intent intent = new Intent(this, MainActivity.class);
+    int requestID = (int) System.currentTimeMillis();
+    PendingIntent pendingIntent = PendingIntent.getActivity(this, requestID, intent, 0);
+    return pendingIntent;
+  }
+
+  private PendingIntent createNavigateToUrlPendingIntent(String url) {
+    String urlToNavigateTo = url;
+    // If this url has metadata
+    if (mUrlToUrlMetadata.get(url) != null) {
+      String siteUrl = mUrlToUrlMetadata.get(url).siteUrl;
+      // If this metadata has a siteUrl
+      if (siteUrl != null) {
+        urlToNavigateTo = siteUrl;
+      }
+    }
+    if (!URLUtil.isNetworkUrl(urlToNavigateTo)) {
+      urlToNavigateTo = "http://" + urlToNavigateTo;
+    }
+    urlToNavigateTo = MetadataResolver.createUrlProxyGoLink(urlToNavigateTo);
+    Intent intent = new Intent(Intent.ACTION_VIEW);
+    intent.setData(Uri.parse(urlToNavigateTo));
+    int requestID = (int) System.currentTimeMillis();
+    PendingIntent pendingIntent = PendingIntent.getActivity(this, requestID, intent, 0);
+    return pendingIntent;
   }
 
   /**
@@ -493,9 +553,12 @@ public class UriBeaconDiscoveryService extends Service implements MetadataResolv
       initializeLists();
       mNotificationManager.cancelAll();
       if (isScreenOn) {
+        mCanUpdateNotifications = false;
+        mHandler.postDelayed(mNotificationUpdateGateTimeout, NOTIFICATION_UPDATE_GATE_DURATION);
         startSearchingForUriBeacons();
         mMdnsUrlDiscoverer.startScanning();
       } else {
+        mHandler.removeCallbacks(mNotificationUpdateGateTimeout);
         stopSearchingForUriBeacons();
         mMdnsUrlDiscoverer.stopScanning();
       }
